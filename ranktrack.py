@@ -8,20 +8,15 @@ from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlparse, parse_qs
 import json
 import time
+import random
 from datetime import datetime
 
 # ------------------------
 # CONFIG
 # ------------------------
 st.set_page_config(page_title="SEO Rank Tracker", page_icon="📈", layout="wide")
-
-SCRAPER_API_KEY = (
-    os.environ.get("SCRAPER_API_KEY")
-    or (st.secrets.get("SCRAPER_API_KEY") if hasattr(st, "secrets") else "")
-)
-
+SCRAPER_API_KEY = "614a33d52e88c3fd0b15d60520ad3d98"  # Your provided key
 DB_PATH = "rank_tracker.db"
-
 DEFAULT_ADMIN_EMAIL = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
 DEFAULT_USER_EMAIL = "user"
@@ -53,6 +48,7 @@ def init_db():
             user_id INTEGER,
             keyword TEXT NOT NULL,
             target_url TEXT NOT NULL,
+            target_domain TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         c.execute("""
@@ -85,11 +81,29 @@ def verify_user(email, password):
                   (email, hash_password(password)))
         return c.fetchone()
 
-def add_keyword(user_id, keyword, target_url):
+def add_user(email, password, is_admin=0):
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO keywords (user_id, keyword, target_url) VALUES (?, ?, ?)",
-                  (user_id, keyword, target_url))
+        c.execute("INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)",
+                  (email, hash_password(password), is_admin))
+        conn.commit()
+
+def get_all_users():
+    with get_conn() as conn:
+        return pd.read_sql_query("SELECT id, email, is_admin, created_at FROM users", conn)
+
+def delete_user(user_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+
+def add_keyword(user_id, keyword, target_url):
+    target_domain = urlparse(target_url).netloc.replace("www.", "").lower()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO keywords (user_id, keyword, target_url, target_domain) VALUES (?, ?, ?, ?)",
+                  (user_id, keyword, target_url, target_domain))
         conn.commit()
 
 def get_user_keywords(user_id):
@@ -105,63 +119,66 @@ def save_ranking(keyword_id, rank_position, url, title, features):
 
 def get_ranking_history(keyword_id):
     with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM rankings WHERE keyword_id=? ORDER BY checked_at DESC", conn, params=(keyword_id,))
+        df = pd.read_sql_query("SELECT * FROM rankings WHERE keyword_id=? ORDER BY checked_at ASC", conn, params=(keyword_id,))
+        df['checked_at'] = pd.to_datetime(df['checked_at'])
+        df['rank_position'] = df['rank_position'].apply(lambda x: x if x <= 100 else 101)  # Cap at 101 for charts
+        return df
 
 # ------------------------
-# SCRAPER AND PARSER
+# SCRAPER AND PARSER (Improved)
 # ------------------------
-def scrape_google_rankings(keyword: str, target_url: str):
-    """Fetch Google results using ScraperAPI and parse."""
-    if not SCRAPER_API_KEY:
-        st.error("No Scraper API key configured. Add SCRAPER_API_KEY in Streamlit secrets.")
-        return None
-
+def scrape_google_rankings(keyword: str, target_domain: str, retries=3):
+    """Fetch Google results using ScraperAPI and parse. Retries on failure."""
     search_url = f"https://www.google.com/search?q={quote_plus(keyword)}&num=100&hl=en&gl=in"
-    api_url = f"https://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(search_url)}"
+    api_url = f"https://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(search_url)}&country_code=in"
+    
+    for attempt in range(retries):
+        try:
+            r = requests.get(api_url, timeout=60)
+            r.raise_for_status()
+            return parse_google_results(r.text, target_domain)
+        except Exception as e:
+            st.warning(f"Error fetching SERP for '{keyword}' (Attempt {attempt+1}/{retries}): {e}")
+            time.sleep(random.uniform(2, 5))  # Rate limit backoff
+    st.error(f"Failed to fetch SERP for '{keyword}' after {retries} attempts.")
+    return None
 
-    try:
-        r = requests.get(api_url, timeout=60)
-        r.raise_for_status()
-    except Exception as e:
-        st.error(f"Error fetching SERP: {e}")
-        return None
-
-    return parse_google_results(r.text, target_url)
-
-def parse_google_results(html: str, target_url: str):
-    """Parse real Google SERP HTML for organic ranking."""
+def parse_google_results(html: str, target_domain: str):
+    """Parse Google SERP HTML for organic ranking and features."""
     soup = BeautifulSoup(html, "lxml")
-    target_domain = urlparse(target_url).netloc.replace("www.", "").lower()
-
-    result = {"rank": 101, "url": target_url, "title": "Not found in top 100", "features": []}
-
-    # SERP features
-    if soup.find(string=lambda s: s and "People also ask" in s):
-        result["features"].append("People Also Ask")
-    if soup.find("div", class_="V3FYCf") or soup.find(string=lambda s: "snippet" in s.lower()):
-        result["features"].append("Featured Snippet")
-
-    # Extract all organic links
-    organic_links = []
-    for a in soup.select("a[href]"):
-        href = a["href"]
-        if href.startswith("/url?"):
-            href = parse_qs(urlparse(href).query).get("q", [""])[0]
-        if "google.com" not in href and href.startswith("http"):
-            organic_links.append(href)
-
+    
+    # Detect SERP features
+    features = []
+    if soup.find("div", {"data-attrid": "hw:Overview"}) or soup.find(string=lambda s: s and "AI Overview" in s):  # AI Overview
+        features.append("AI Overview")
+    if soup.find("div", {"data-attrid": "hw:Questions & answers"}) or soup.find(string=lambda s: s and "People also ask" in s):  # PAA
+        features.append("People Also Ask")
+    if soup.find("div", class_="thODed") or soup.find("div", {"data-attrid": "hw:Featured Snippet"}):  # Featured Snippet
+        features.append("Featured Snippet")
+    if soup.find("div", class_="vk_c") or soup.find("div", {"data-attrid": "hw:Knowledge Panel"}):  # Knowledge Panel
+        features.append("Knowledge Panel")
+    
+    # Extract organic results (div.g, with h3 and a[href])
+    organic_results = []
     rank = 1
-    for link in organic_links:
-        domain = urlparse(link).netloc.replace("www.", "").lower()
-        if target_domain and target_domain in domain:
-            result["rank"] = rank
-            result["url"] = link
-            result["title"] = link.split("/")[2]
+    for g in soup.select("div.g"):
+        a = g.select_one("a[href]")
+        h3 = g.select_one("h3")
+        if a and h3 and "google.com" not in a["href"] and not g.select("div[data-text-ad]"):  # Organic only, skip ads
+            href = a["href"]
+            if href.startswith("/url?"):
+                href = parse_qs(urlparse(href).query).get("q", [""])[0]
+            title = h3.text.strip() if h3 else "No Title"
+            domain = urlparse(href).netloc.replace("www.", "").lower()
+            organic_results.append({"rank": rank, "url": href, "title": title, "domain": domain})
+            rank += 1
+    
+    # Find matching rank
+    result = {"rank": 101, "url": "Not found", "title": "Not found in top 100", "features": features}
+    for res in organic_results:
+        if target_domain in res["domain"]:
+            result = {"rank": res["rank"], "url": res["url"], "title": res["title"], "features": features}
             break
-        rank += 1
-        if rank > 100:
-            break
-
     return result
 
 # ------------------------
@@ -169,7 +186,7 @@ def parse_google_results(html: str, target_url: str):
 # ------------------------
 def login_page():
     st.title("🔐 SEO Rank Tracker Login")
-    email = st.text_input("Username", key="login_email")
+    email = st.text_input("Email", key="login_email")
     password = st.text_input("Password", type="password", key="login_password")
     if st.button("Login", type="primary"):
         user = verify_user(email, password)
@@ -188,61 +205,96 @@ def dashboard_view():
     if keywords.empty:
         st.info("No keywords added yet.")
         return
-
+    st.dataframe(keywords[["keyword", "target_url", "created_at"]])
     for _, row in keywords.iterrows():
         with st.expander(f"🔑 {row['keyword']} | 🎯 {row['target_url']}"):
             data = get_ranking_history(row['id'])
             if not data.empty:
-                latest = data.iloc[0]
-                st.metric("Current Rank", f"#{latest['rank_position']}")
-                try:
-                    feats = json.loads(latest['features']) if latest['features'] else []
-                except:
-                    feats = []
+                latest = data.iloc[-1]  # Latest is last (ASC order)
+                st.metric("Latest Rank", f"#{latest['rank_position'] if latest['rank_position'] <= 100 else 'Not in Top 100'}")
+                feats = json.loads(latest['features']) if latest['features'] else []
                 if feats:
                     st.caption("SERP Features: " + ", ".join(feats))
+                # Trend chart
+                trend_df = data[["checked_at", "rank_position"]].set_index("checked_at")
+                st.line_chart(trend_df, use_container_width=True, height=200)
             else:
                 st.caption("No ranking data yet. Run a check.")
 
 def add_keyword_view():
     st.header("➕ Add Keywords")
-    keyword = st.text_input("Keyword")
-    url = st.text_input("Target URL")
-    if st.button("Add Keyword"):
-        if keyword and url:
-            add_keyword(st.session_state.user_id, keyword, url)
-            st.success("Keyword added successfully!")
-        else:
-            st.warning("Please fill both fields.")
+    tab1, tab2, tab3 = st.tabs(["Manual", "CSV Upload", "Copy-Paste"])
+    
+    with tab1:
+        keyword = st.text_input("Keyword")
+        url = st.text_input("Target URL")
+        if st.button("Add Single Keyword"):
+            if keyword and url:
+                add_keyword(st.session_state.user_id, keyword, url)
+                st.success("Keyword added!")
+
+    with tab2:
+        uploaded_file = st.file_uploader("Upload CSV (columns: keyword, target_url)", type="csv")
+        if uploaded_file and st.button("Add from CSV"):
+            df = pd.read_csv(uploaded_file)
+            for _, row in df.iterrows():
+                add_keyword(st.session_state.user_id, row['keyword'], row['target_url'])
+            st.success(f"Added {len(df)} keywords!")
+
+    with tab3:
+        paste = st.text_area("Paste keywords (one per line: keyword,target_url)")
+        if paste and st.button("Add from Paste"):
+            lines = paste.strip().split("\n")
+            for line in lines:
+                parts = line.split(",")
+                if len(parts) == 2:
+                    add_keyword(st.session_state.user_id, parts[0].strip(), parts[1].strip())
+            st.success(f"Added {len(lines)} keywords!")
 
 def check_rankings_view():
-    st.header("🔍 Check Rankings")
+    st.header("🔍 Check Rankings (Daily Manual Run)")
     keywords = get_user_keywords(st.session_state.user_id)
     if keywords.empty:
         st.info("Add keywords first.")
         return
-
     selected = st.multiselect("Select keywords to check:", keywords["keyword"].tolist())
     if st.button("Run Check"):
         if not selected:
-            st.warning("Please select at least one keyword.")
+            st.warning("Select at least one keyword.")
             return
-
         progress = st.progress(0)
         for i, kw in enumerate(selected):
             row = keywords[keywords["keyword"] == kw].iloc[0]
-            res = scrape_google_rankings(row["keyword"], row["target_url"])
+            res = scrape_google_rankings(row["keyword"], row["target_domain"])
             if res:
                 save_ranking(row["id"], res["rank"], res["url"], res["title"], res["features"])
-                rank_text = f"✅ {kw}: Found at #{res['rank']}" if res["rank"] <= 100 else f"🔴 {kw}: Not in top 100"
+                rank_text = f"✅ {kw}: #{res['rank']}" if res["rank"] <= 100 else f"🔴 {kw}: Not in top 100"
                 st.info(rank_text)
                 if res["features"]:
-                    st.caption("SERP Features: " + ", ".join(res["features"]))
-            else:
-                st.error(f"Failed for {kw}")
+                    st.caption("Features: " + ", ".join(res["features"]))
+            time.sleep(random.uniform(2, 5))  # Rate limit
             progress.progress((i + 1) / len(selected))
-            time.sleep(0.5)
-        st.success("✅ All rankings checked!")
+        st.success("All checks complete!")
+
+def admin_panel():
+    st.header("🛡️ Admin Panel")
+    users = get_all_users()
+    st.dataframe(users)
+    
+    # Add user
+    new_email = st.text_input("New User Email")
+    new_pass = st.text_input("New User Password", type="password")
+    is_admin = st.checkbox("Make Admin?")
+    if st.button("Add User"):
+        if new_email and new_pass:
+            add_user(new_email, new_pass, 1 if is_admin else 0)
+            st.success("User added!")
+    
+    # Delete user
+    del_id = st.selectbox("Select User ID to Delete:", users["id"].tolist())
+    if st.button("Delete User"):
+        delete_user(del_id)
+        st.success("User deleted!")
 
 # ------------------------
 # MAIN
@@ -251,24 +303,25 @@ def main():
     init_db()
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
-
     if not st.session_state.logged_in:
         login_page()
         return
-
+    
     st.sidebar.write(f"👤 {st.session_state.email}")
     if st.sidebar.button("Logout"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.experimental_rerun()
-
-    tab = st.sidebar.radio("Navigation", ["Dashboard", "Add Keywords", "Check Rankings"])
+        st.rerun()
+    
+    tab = st.sidebar.radio("Navigation", ["Dashboard", "Add Keywords", "Check Rankings"] + (["Admin Panel"] if st.session_state.is_admin else []))
     if tab == "Dashboard":
         dashboard_view()
     elif tab == "Add Keywords":
         add_keyword_view()
-    else:
+    elif tab == "Check Rankings":
         check_rankings_view()
+    elif tab == "Admin Panel":
+        admin_panel()
 
 if __name__ == "__main__":
     main()
