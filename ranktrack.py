@@ -120,8 +120,9 @@ def save_ranking(keyword_id, rank_position, url, title, features):
 def get_ranking_history(keyword_id):
     with get_conn() as conn:
         df = pd.read_sql_query("SELECT * FROM rankings WHERE keyword_id=? ORDER BY checked_at ASC", conn, params=(keyword_id,))
-        df['checked_at'] = pd.to_datetime(df['checked_at'])
-        df['rank_position'] = df['rank_position'].apply(lambda x: x if x <= 100 else 101)  # Cap at 101 for charts
+        if not df.empty:
+            df['checked_at'] = pd.to_datetime(df['checked_at'])
+            df['rank_position'] = df['rank_position'].apply(lambda x: x if x <= 100 else 101)  # Cap at 101 for charts
         return df
 
 # ------------------------
@@ -138,9 +139,12 @@ def scrape_google_rankings(keyword: str, target_domain: str, retries=3):
             r.raise_for_status()
             return parse_google_results(r.text, target_domain)
         except Exception as e:
-            st.warning(f"Error fetching SERP for '{keyword}' (Attempt {attempt+1}/{retries}): {e}")
-            time.sleep(random.uniform(2, 5))  # Rate limit backoff
-    st.error(f"Failed to fetch SERP for '{keyword}' after {retries} attempts.")
+            if attempt < retries - 1:
+                st.warning(f"Error fetching SERP for '{keyword}' (Attempt {attempt+1}/{retries}): {e}")
+                time.sleep(random.uniform(2, 5))  # Rate limit backoff
+            else:
+                st.error(f"Failed to fetch SERP for '{keyword}' after {retries} attempts.")
+                return None
     return None
 
 def parse_google_results(html: str, target_domain: str):
@@ -172,6 +176,8 @@ def parse_google_results(html: str, target_domain: str):
             domain = urlparse(href).netloc.replace("www.", "").lower()
             organic_results.append({"rank": rank, "url": href, "title": title, "domain": domain})
             rank += 1
+            if rank > 100:
+                break
     
     # Find matching rank
     result = {"rank": 101, "url": "Not found", "title": "Not found in top 100", "features": features}
@@ -194,8 +200,9 @@ def login_page():
             st.session_state.logged_in = True
             st.session_state.user_id = user[0]
             st.session_state.is_admin = bool(user[1])
-            st.session_state.email = email
+            st.session_state.email = email  # Ensure this is set
             st.success("Login successful!")
+            st.rerun()  # Refresh UI after login
         else:
             st.error("Invalid credentials!")
 
@@ -211,7 +218,8 @@ def dashboard_view():
             data = get_ranking_history(row['id'])
             if not data.empty:
                 latest = data.iloc[-1]  # Latest is last (ASC order)
-                st.metric("Latest Rank", f"#{latest['rank_position'] if latest['rank_position'] <= 100 else 'Not in Top 100'}")
+                rank_display = f"#{latest['rank_position']}" if latest['rank_position'] <= 100 else "Not in Top 100"
+                st.metric("Latest Rank", rank_display)
                 feats = json.loads(latest['features']) if latest['features'] else []
                 if feats:
                     st.caption("SERP Features: " + ", ".join(feats))
@@ -232,24 +240,34 @@ def add_keyword_view():
             if keyword and url:
                 add_keyword(st.session_state.user_id, keyword, url)
                 st.success("Keyword added!")
+                st.rerun()
+            else:
+                st.warning("Please fill both fields.")
 
     with tab2:
         uploaded_file = st.file_uploader("Upload CSV (columns: keyword, target_url)", type="csv")
         if uploaded_file and st.button("Add from CSV"):
             df = pd.read_csv(uploaded_file)
+            added_count = 0
             for _, row in df.iterrows():
-                add_keyword(st.session_state.user_id, row['keyword'], row['target_url'])
-            st.success(f"Added {len(df)} keywords!")
+                if 'keyword' in row and 'target_url' in row and pd.notna(row['keyword']) and pd.notna(row['target_url']):
+                    add_keyword(st.session_state.user_id, row['keyword'], row['target_url'])
+                    added_count += 1
+            st.success(f"Added {added_count} keywords!")
+            st.rerun()
 
     with tab3:
         paste = st.text_area("Paste keywords (one per line: keyword,target_url)")
         if paste and st.button("Add from Paste"):
             lines = paste.strip().split("\n")
+            added_count = 0
             for line in lines:
-                parts = line.split(",")
-                if len(parts) == 2:
-                    add_keyword(st.session_state.user_id, parts[0].strip(), parts[1].strip())
-            st.success(f"Added {len(lines)} keywords!")
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    add_keyword(st.session_state.user_id, parts[0], parts[1])
+                    added_count += 1
+            st.success(f"Added {added_count} keywords!")
+            st.rerun()
 
 def check_rankings_view():
     st.header("🔍 Check Rankings (Daily Manual Run)")
@@ -272,9 +290,12 @@ def check_rankings_view():
                 st.info(rank_text)
                 if res["features"]:
                     st.caption("Features: " + ", ".join(res["features"]))
+            else:
+                st.error(f"Failed for {kw}")
             time.sleep(random.uniform(2, 5))  # Rate limit
             progress.progress((i + 1) / len(selected))
         st.success("All checks complete!")
+        st.rerun()
 
 def admin_panel():
     st.header("🛡️ Admin Panel")
@@ -289,12 +310,15 @@ def admin_panel():
         if new_email and new_pass:
             add_user(new_email, new_pass, 1 if is_admin else 0)
             st.success("User added!")
+            st.rerun()
     
     # Delete user
-    del_id = st.selectbox("Select User ID to Delete:", users["id"].tolist())
-    if st.button("Delete User"):
-        delete_user(del_id)
-        st.success("User deleted!")
+    if not users.empty:
+        del_id = st.selectbox("Select User ID to Delete:", users["id"].tolist())
+        if st.button("Delete User"):
+            delete_user(del_id)
+            st.success("User deleted!")
+            st.rerun()
 
 # ------------------------
 # MAIN
@@ -303,24 +327,39 @@ def main():
     init_db()
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
+
     if not st.session_state.logged_in:
         login_page()
         return
-    
-    st.sidebar.write(f"👤 {st.session_state.email}")
+
+    # --- SAFE SIDEBAR ---
+    if "email" in st.session_state:
+        st.sidebar.write(f"👤 {st.session_state.email}")
+    else:
+        st.sidebar.write("👤 (unknown)")
+
     if st.sidebar.button("Logout"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
+        keys_to_clear = ["logged_in", "user_id", "is_admin", "email"]
+        for key in keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.success("Logged out successfully!")
         st.rerun()
-    
-    tab = st.sidebar.radio("Navigation", ["Dashboard", "Add Keywords", "Check Rankings"] + (["Admin Panel"] if st.session_state.is_admin else []))
+
+    # Navigation
+    tabs = ["Dashboard", "Add Keywords", "Check Rankings"]
+    if st.session_state.get("is_admin", False):
+        tabs.append("Admin Panel")
+
+    tab = st.sidebar.radio("Navigation", tabs)
+
     if tab == "Dashboard":
         dashboard_view()
     elif tab == "Add Keywords":
         add_keyword_view()
     elif tab == "Check Rankings":
         check_rankings_view()
-    elif tab == "Admin Panel":
+    elif tab == "Admin Panel" and st.session_state.get("is_admin"):
         admin_panel()
 
 if __name__ == "__main__":
