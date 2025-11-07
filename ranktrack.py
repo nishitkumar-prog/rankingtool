@@ -1,4 +1,4 @@
-# streamlit_rank_tracker_fixed.py
+# streamlit_rank_tracker_complete.py
 import os
 import streamlit as st
 import pandas as pd
@@ -10,10 +10,12 @@ import plotly.graph_objects as go
 from io import StringIO
 import time
 import json
-from urllib.parse import quote_plus, urlparse, parse_qs, unquote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 from typing import Optional
 
-# Page configuration
+# -------------------------
+# App configuration
+# -------------------------
 st.set_page_config(
     page_title="SEO Rank Tracker",
     page_icon="📈",
@@ -21,25 +23,32 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Configuration & secrets ---
-# Prefer environment variable or Streamlit secrets for API key:
+# Read Scraper API key from Streamlit secrets or environment (do not hardcode keys here)
 SCRAPER_API_KEY = (
     os.environ.get("SCRAPER_API_KEY")
-    or st.secrets.get("SCRAPER_API_KEY", "") if "secrets" in dir(st) else ""
+    or (st.secrets.get("SCRAPER_API_KEY") if hasattr(st, "secrets") else None)
+    or ""
 )
-# For local dev fallback (only use if you really want to hardcode)
-# SCRAPER_API_KEY = "your_key_here"
 
-ADMIN_EMAIL = "admin@herovired.com"
-ADMIN_PASSWORD = "herovired_admin_2024"
 DB_PATH = "rank_tracker.db"
 
-# --- Database helpers ---
+# Default credentials for easy testing (CHANGE these in production)
+# Login uses 'email' field; for convenience we create two default users:
+# Admin credentials: email = "admin", password = "admin"
+# Non-admin credentials: email = "user", password = "user"
+DEFAULT_ADMIN_EMAIL = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin"
+DEFAULT_USER_EMAIL = "user"
+DEFAULT_USER_PASSWORD = "user"
+
+# -------------------------
+# Database helpers
+# -------------------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    """Initialize SQLite database (idempotent)."""
+    """Initialize SQLite DB and default users (only if missing)."""
     with get_conn() as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users
@@ -64,24 +73,25 @@ def init_db():
                       features TEXT,
                       checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                       FOREIGN KEY (keyword_id) REFERENCES keywords (id))''')
-        # Insert admin if not present
-        admin_hash = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
-        c.execute("SELECT id FROM users WHERE email = ?", (ADMIN_EMAIL,))
+        # Insert default admin and user if not exist
+        admin_hash = hash_password(DEFAULT_ADMIN_PASSWORD)
+        user_hash = hash_password(DEFAULT_USER_PASSWORD)
+        c.execute("SELECT id FROM users WHERE email = ?", (DEFAULT_ADMIN_EMAIL,))
         if not c.fetchone():
             c.execute("INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)",
-                      (ADMIN_EMAIL, admin_hash, 1))
-        # example non-admin user (only if not exists)
-        c.execute("SELECT id FROM users WHERE email = ?", ("seo@herovired.com",))
+                      (DEFAULT_ADMIN_EMAIL, admin_hash, 1))
+        c.execute("SELECT id FROM users WHERE email = ?", (DEFAULT_USER_EMAIL,))
         if not c.fetchone():
-            user_hash = hashlib.sha256("herovired123".encode()).hexdigest()
             c.execute("INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)",
-                      ("seo@herovired.com", user_hash, 0))
+                      (DEFAULT_USER_EMAIL, user_hash, 0))
         conn.commit()
 
 def hash_password(password: str) -> str:
+    """Simple SHA256 hashing (ok for demo; use bcrypt in production)."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_user(email: str, password: str):
+    """Return (id, is_admin) if credentials valid else None."""
     password_hash = hash_password(password)
     with get_conn() as conn:
         c = conn.cursor()
@@ -151,42 +161,34 @@ def get_ranking_history(keyword_id: int, days: int = 30):
         """
         return pd.read_sql_query(query, conn, params=(keyword_id, days))
 
-# --- Scraping & parsing ---
+# -------------------------
+# Scraping & parsing
+# -------------------------
 def extract_final_url(raw_url: str) -> str:
-    """Google often returns /url?q=...; extract the real URL if present"""
-    if raw_url.startswith("/url?") or raw_url.startswith("/url?q="):
-        parsed = parse_qs(urlparse(raw_url).query)
-        q = parsed.get("q")
+    """Handle Google's /url?q= redirect format."""
+    if raw_url.startswith("/url?") or raw_url.startswith("/url?q=") or "/url?q=" in raw_url:
+        parsed = urlparse(raw_url)
+        q = parse_qs(parsed.query).get("q")
         if q:
             return q[0]
-    # if it is direct, return as-is
     return raw_url
 
 def parse_google_results(html_content: str, target_url: str):
-    """Parse Google search results from HTML with robust selectors"""
+    """Robust-ish parsing of Google SERP HTML (best-effort)."""
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html_content, 'html.parser')
-    results = {
-        "rank": None,
-        "url": None,
-        "title": None,
-        "features": []
-    }
+    results = {"rank": None, "url": None, "title": None, "features": []}
 
-    # SERP features detection heuristics (very simple)
-    # AI Overview / People also ask / Featured snippet heuristics:
-    if soup.find(lambda tag: tag.name == "div" and tag.get("role") == "main" and "ai-overview" in str(tag.get("class", "")).lower()):
+    # SERP features (heuristics)
+    if soup.find(lambda tag: tag.name == "div" and "ai-overview" in str(tag.get("class", "")).lower()):
         results["features"].append("AI Overview")
-
-    # People Also Ask: look for typical PAA containers
     if soup.find_all(lambda tag: tag.name == "div" and "related-question" in str(tag.get("class", "")).lower()):
         results["features"].append("People Also Ask")
-    # Featured snippet (heuristic)
     if soup.find(lambda tag: tag.name == "div" and ("featured" in str(tag.get("class", "")).lower() or "answer" in str(tag.get("class", "")).lower())):
         results["features"].append("Featured Snippet")
 
-    # Find organic entries by searching for <a><h3> patterns (reliable)
+    # Find organic results by <a> > <h3> pattern
     h3_links = soup.select("a > h3")
     rank_counter = 1
     for h3 in h3_links:
@@ -196,18 +198,15 @@ def parse_google_results(html_content: str, target_url: str):
         raw_href = a_tag["href"]
         final_url = extract_final_url(raw_href)
         title = h3.get_text(strip=True) or "No title"
-
-        # normalize target comparison
         if target_url and target_url.lower().rstrip("/") in final_url.lower().rstrip("/") and results["rank"] is None:
             results["rank"] = rank_counter
             results["url"] = final_url
             results["title"] = title
-
         rank_counter += 1
         if rank_counter > 100:
             break
 
-    # fallback: if not found and had no a>h3 matches, try div.g
+    # Fallback to div.g if nothing found
     if results["rank"] is None and not h3_links:
         organic = soup.select("div.g")
         rank_counter = 1
@@ -218,7 +217,6 @@ def parse_google_results(html_content: str, target_url: str):
                 continue
             final_url = extract_final_url(a["href"])
             title = h3.get_text(strip=True) if h3 else "No title"
-
             if target_url and target_url.lower().rstrip("/") in final_url.lower().rstrip("/") and results["rank"] is None:
                 results["rank"] = rank_counter
                 results["url"] = final_url
@@ -235,105 +233,108 @@ def parse_google_results(html_content: str, target_url: str):
     return results
 
 def scrape_google_rankings(keyword: str, target_url: str, scraper_api_key: Optional[str]):
-    """Scrape Google rankings using ScraperAPI with basic retry and error feedback."""
+    """
+    Query ScraperAPI (or similar) and parse Google results.
+    scraper_api_key can be set in Streamlit secrets or environment.
+    """
     if not scraper_api_key:
-        st.error("No Scraper API key configured. Set SCRAPER_API_KEY in environment or Streamlit secrets.")
+        st.error("No Scraper API key configured. Set SCRAPER_API_KEY in Streamlit secrets or env vars.")
         return None
 
     search_url = f"https://www.google.com/search?q={quote_plus(keyword)}&num=100&gl=in&hl=en"
-    # Use HTTPS, add render=true to support JS-rendered parts if the provider offers it
     api_url = f"https://api.scraperapi.com?api_key={scraper_api_key}&url={quote_plus(search_url)}&render=true"
 
     tries = 0
     max_tries = 2
     backoff = 1.5
-
     while tries <= max_tries:
         try:
             resp = requests.get(api_url, timeout=60)
-            # If provider returns a 500/502/503 — surface a clear error
             if resp.status_code >= 500:
-                # Provide actionable error
-                st.warning(f"Scraper provider returned {resp.status_code}. Attempt {tries + 1}/{max_tries+1}")
+                st.warning(f"Scraper provider returned HTTP {resp.status_code}. Attempt {tries+1}/{max_tries+1}")
                 tries += 1
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-
             resp.raise_for_status()
             html_content = resp.text
-            # Basic health check
             if not html_content or len(html_content) < 100:
-                st.warning("Received very small HTML response from scraper provider.")
+                st.warning("Received unexpectedly small HTML response from scraper provider.")
                 return None
-
-            parsed = parse_google_results(html_content, target_url)
-            return parsed
-
+            return parse_google_results(html_content, target_url)
         except requests.exceptions.HTTPError as he:
-            st.error(f"HTTP error contacting scraper provider: {he} (status {getattr(he.response, 'status_code', 'N/A')})")
+            st.error(f"HTTP error contacting scraper provider: {he}")
             return None
         except requests.exceptions.RequestException as e:
-            st.warning(f"Network error contacting scraper provider: {e}. Attempt {tries + 1}/{max_tries+1}")
+            st.warning(f"Network error contacting scraper provider: {e}. Attempt {tries+1}/{max_tries+1}")
             tries += 1
             time.sleep(backoff)
             backoff *= 2
             continue
-
     st.error("Failed to fetch results from ScraperAPI after multiple attempts.")
     return None
 
-# --- Styling and UI helpers ---
+# -------------------------
+# UI styling
+# -------------------------
 def local_css():
     st.markdown("""
     <style>
-        .main-header {font-size: 2.2rem; font-weight: 700; color: #1f77b4; text-align:center; margin-bottom:1rem;}
-        .feature-badge { display:inline-block; padding:0.25rem 0.6rem; margin:0.25rem; border-radius:12px; background:#4CAF50; color:#fff; font-size:0.85rem;}
+      .main-header { font-size: 2.2rem; font-weight:700; color:#1f77b4; text-align:center; margin-bottom:1rem; }
+      .feature-badge { display:inline-block; padding:0.25rem 0.6rem; margin:0.25rem; border-radius:12px; background:#4CAF50; color:#fff; font-size:0.85rem; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Authentication UI ---
+# -------------------------
+# Authentication UI
+# -------------------------
 def login_page():
     st.markdown('<h1 class="main-header">🔐 SEO Rank Tracker Login</h1>', unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown("### Sign In")
-        email = st.text_input("Email", key="login_email")
+        email = st.text_input("Email / Username", key="login_email")
         password = st.text_input("Password", type="password", key="login_password")
         if st.button("Login", type="primary"):
-            if email and password:
-                result = verify_user(email, password)
-                if result:
-                    st.session_state.logged_in = True
-                    st.session_state.user_id = result[0]
-                    st.session_state.user_email = email
-                    st.session_state.is_admin = bool(result[1])
-                    st.experimental_rerun()
-                else:
-                    st.error("Invalid credentials!")
-            else:
+            if not email or not password:
                 st.warning("Please enter both email and password!")
+                return
+            result = verify_user(email, password)
+            if result:
+                st.session_state.logged_in = True
+                st.session_state.user_id = int(result[0])
+                st.session_state.user_email = email
+                st.session_state.is_admin = bool(result[1])
+                # No explicit rerun here — returning is safer
+                return
+            else:
+                st.error("Invalid credentials!")
 
-# --- Admin panel ---
+# -------------------------
+# Admin panel
+# -------------------------
 def admin_panel():
     st.markdown('<h1 class="main-header">👑 Admin Panel</h1>', unsafe_allow_html=True)
     tab1, tab2 = st.tabs(["👥 Manage Users", "➕ Add User"])
     with tab1:
         st.subheader("All Users")
         users_df = get_all_users()
-        users_df['is_admin'] = users_df['is_admin'].map({0: '❌', 1: '✅'})
-        st.dataframe(users_df, use_container_width=True)
-        st.subheader("Delete User")
-        candidates = users_df[users_df['email'] != ADMIN_EMAIL]['email'].tolist()
-        if candidates:
-            delete_email = st.selectbox("Select user to delete", candidates)
-            if st.button("🗑️ Delete User", type="secondary"):
-                user_id = users_df[users_df['email'] == delete_email]['id'].values[0]
-                delete_user(int(user_id))
-                st.success(f"User {delete_email} deleted successfully!")
-                st.experimental_rerun()
+        if users_df.empty:
+            st.info("No users found.")
         else:
-            st.info("No deletable users found.")
+            users_df['is_admin'] = users_df['is_admin'].map({0: '❌', 1: '✅'})
+            st.dataframe(users_df, use_container_width=True)
+            st.subheader("Delete User")
+            candidates = users_df[users_df['email'] != DEFAULT_ADMIN_EMAIL]['email'].tolist()
+            if candidates:
+                delete_email = st.selectbox("Select user to delete", candidates)
+                if st.button("🗑️ Delete User", type="secondary"):
+                    user_id = int(users_df[users_df['email'] == delete_email]['id'].values[0])
+                    delete_user(user_id)
+                    st.success(f"User {delete_email} deleted successfully!")
+                    return
+            else:
+                st.info("No deletable users found.")
     with tab2:
         st.subheader("Add New User")
         new_email = st.text_input("Email", key="new_user_email")
@@ -349,7 +350,9 @@ def admin_panel():
             else:
                 st.warning("Please fill all fields!")
 
-# --- Main app UI ---
+# -------------------------
+# Main app views
+# -------------------------
 def dashboard_view():
     st.subheader("Your Keywords")
     keywords_df = get_user_keywords(st.session_state.user_id)
@@ -373,9 +376,9 @@ def dashboard_view():
                         features = []
                     if features:
                         st.markdown("**SERP Features:**")
-                        for feature in features:
-                            st.markdown(f'<span class="feature-badge">{feature}</span>', unsafe_allow_html=True)
-                    # trend
+                        for f in features:
+                            st.markdown(f'<span class="feature-badge">{f}</span>', unsafe_allow_html=True)
+                    # trend chart
                     if len(history_df) > 1:
                         history_df['checked_at'] = pd.to_datetime(history_df['checked_at'])
                         fig = go.Figure()
@@ -398,7 +401,7 @@ def dashboard_view():
                 if st.button("🗑️ Delete", key=f"delete_{row['id']}"):
                     delete_keyword(row['id'])
                     st.success("Keyword deleted!")
-                    st.experimental_rerun()
+                    return
 
 def add_keywords_view():
     st.subheader("Add Keywords to Track")
@@ -413,11 +416,11 @@ def add_keywords_view():
             if keyword and target_url:
                 add_keyword(st.session_state.user_id, keyword, target_url)
                 st.success(f"Keyword '{keyword}' added successfully!")
-                st.experimental_rerun()
+                return
             else:
                 st.warning("Please fill all fields!")
     elif input_method == "CSV Upload":
-        st.info("Upload a CSV with columns: 'keyword' and 'target_url'")
+        st.info("Upload a CSV file with columns: 'keyword' and 'target_url'")
         uploaded_file = st.file_uploader("Choose CSV file", type=['csv'])
         if uploaded_file:
             df = pd.read_csv(uploaded_file)
@@ -427,11 +430,11 @@ def add_keywords_view():
                     for _, r in df.iterrows():
                         add_keyword(st.session_state.user_id, r['keyword'], r['target_url'])
                     st.success(f"Imported {len(df)} keywords successfully!")
-                    st.experimental_rerun()
+                    return
             else:
                 st.error("CSV must have 'keyword' and 'target_url' columns!")
     else:
-        st.info("Paste lines in format: keyword | target_url")
+        st.info("Paste keywords (one per line) in format: keyword | target_url")
         text_input = st.text_area("Paste here", height=200, key="paste_keywords")
         if st.button("Import Keywords", type="primary"):
             lines = [ln.strip() for ln in text_input.strip().splitlines() if ln.strip()]
@@ -443,7 +446,7 @@ def add_keywords_view():
                         add_keyword(st.session_state.user_id, parts[0], parts[1])
                         count += 1
             st.success(f"Imported {count} keywords successfully!")
-            st.experimental_rerun()
+            return
 
 def check_rankings_view():
     st.subheader("Check Keyword Rankings")
@@ -484,12 +487,13 @@ def check_rankings_view():
             else:
                 st.error(f"Failed to check: {keyword} — see messages above for details.")
             progress.progress((i + 1) / total)
-            # tiny pause to avoid aggressive polling (keep minimal)
             time.sleep(0.6)
         status.text("✅ All rankings checked!")
         st.balloons()
 
-# --- Main ---
+# -------------------------
+# Main entry
+# -------------------------
 def main():
     init_db()
     local_css()
@@ -508,15 +512,13 @@ def main():
         if st.button("🚪 Logout"):
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
-            st.experimental_rerun()
+            return
         st.markdown("---")
         st.markdown("**App Settings**")
-        if SCRAPER_API_KEY:
-            st.write("Scraper API: configured")
-        else:
-            st.write("Scraper API: NOT configured (set environment variable or secrets)")
+        scr_status = "configured" if SCRAPER_API_KEY else "NOT configured"
+        st.write(f"Scraper API: {scr_status}")
 
-    # Admin area toggle
+    # Admin toggle
     if st.session_state.get('is_admin', False):
         if st.sidebar.button("👑 Admin Panel"):
             st.session_state.show_admin = True
